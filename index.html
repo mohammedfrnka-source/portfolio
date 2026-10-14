@@ -396,6 +396,7 @@ var D = {
   fonts: [], gfonts: [], crop: {}, cap: {}, hidden: {}, imgHidden: {}, mediaSizes: {}, chunks: {},
   page: {kind: "main", title: "فيديو وموشن", intro: "", home: "", links: []},
   availability: {show: true, text: "متاح لمشاريع جديدة"},
+  gh: {repo: "mohammedfrnka-source/portfolio", branch: "main"},
   layout: {align: {hero: "end", about: "center", ba: "center"}, order: {hero: ["avail","role","tagline","cta"], about: ["eyebrow","title","bio","stats"], ba: ["eyebrow","title","text"]}},
   clients: [{img:"",name:"عميل 1"},{img:"",name:"عميل 2"},{img:"",name:"عميل 3"},{img:"",name:"عميل 4"},{img:"",name:"عميل 5"},{img:"",name:"عميل 6"}],
   testimonials: [{q:"اكتب هنا رأي عميل حقيقي بكلماته.",name:"اسم العميل",role:"المنصب، الشركة"}],
@@ -469,6 +470,7 @@ var app = document.getElementById("app");
 var editing = false, dirty = false, filter = "all", openId = null, drawer = false, tab = "design";
 var artifactNs = null, canEdit = false, pending = null, saving = false, discardArm = false;
 var LIMIT = 14 * 1024 * 1024, TOTAL = 254 * 1024 * 1024, BATCH = 20 * 1024 * 1024, VID_TARGET = 24 * 1024 * 1024, PART = 14 * 1024 * 1024, IMG_TARGET = 1536 * 1024, IMG_MAX = 2800, VID_EDGE = 1920;
+if (!window.claude) { TOTAL = 900 * 1024 * 1024; BATCH = 30 * 1024 * 1024; PART = 50 * 1024 * 1024; } /* hosted on GitHub: no claude.ai limits */
 var RESET = ':root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}';
 
 /* ---------- helpers ---------- */
@@ -1698,11 +1700,13 @@ function save(){
     try { sessionStorage.removeItem("pf-pending"); } catch (e) {}
     sent.forEach(function(n){ delete pendingFiles[n]; });
     draftClear();
-    dirty = false; saving = false; ORIGINAL = JSON.stringify(S); hLast = ORIGINAL; toast("تم الحفظ والنشر"); render();
+    dirty = false; saving = false; ORIGINAL = JSON.stringify(S); hLast = ORIGINAL; toast("تم الحفظ والنشر" + (!window.claude ? " · يظهر للزوار خلال دقيقة تقريباً" : "")); render();
   }).catch(function(e){
     saving = false;
     var c = e && e.code;
-    if (c === "conflict") toast("نُشرت نسخة أحدث، الصفحة تتحدث وتقدر تسترجع تعديلاتك");
+    if (c === "gh_auth") { try { localStorage.removeItem("pf-gh-token"); } catch (e2) {} ghMem = ""; canEdit = false; editing = false; toast("المفتاح غير صالح أو منتهي أو بلا صلاحية. افتح الرابط مع #edit وأدخل مفتاحاً جديداً. تعديلاتك محفوظة في المتصفح."); }
+    else if (c === "gh_conflict") toast("تغيّر المستودع أثناء الحفظ. حاول الحفظ مرة أخرى.");
+    else if (c === "conflict") toast("نُشرت نسخة أحدث، الصفحة تتحدث وتقدر تسترجع تعديلاتك");
     else if (c === "too_large") toast("الحجم كبير جداً. احذف فيديو أو قلّل الصور.");
     else if (c === "rate_limited") toast("انتظر دقيقة ثم احفظ مرة أخرى.");
     else if (c === "capability_disabled") toast("الحفظ متوقف لأن الرابط العام مفعّل. أوقف الرابط العام من زر Share، احفظ، ثم فعّله من جديد. تعديلاتك ما زالت هنا.");
@@ -1923,8 +1927,89 @@ render();
     });
   }, {passive: true});
 })();
+
+/* ---------- GitHub mode: on GitHub Pages the owner opens the site with #edit, signs in with a token, and every save is a commit ---------- */
+var GHT = "pf-gh-token", ghMem = "";
+function ghCfg(){
+  var g = S.gh || {}, repo = g.repo || "";
+  if (!repo) { var m = /^([^.]+)\.github\.io$/.exec(location.hostname), p = location.pathname.split("/").filter(Boolean)[0]; if (m) repo = m[1] + "/" + (p && !/\./.test(p) ? p : m[1] + ".github.io"); }
+  return {repo: repo, branch: g.branch || "main"};
+}
+function ghTok(){ if (ghMem) return ghMem; try { return localStorage.getItem(GHT) || ""; } catch (e) { return ""; } }
+function ghApi(path, opt){
+  opt = opt || {};
+  var h = {"Authorization": "Bearer " + ghTok(), "Accept": opt.raw ? "application/vnd.github.raw+json" : "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"};
+  if (opt.body) h["Content-Type"] = "application/json";
+  return fetch("https://api.github.com/repos/" + ghCfg().repo + path, {method: opt.method || "GET", headers: h, body: opt.body ? JSON.stringify(opt.body) : undefined, cache: "no-store"}).then(function(r){
+    if (!r.ok) { var e = new Error("http " + r.status); e.status = r.status; throw e; }
+    return opt.raw ? r.text() : r.json();
+  });
+}
+function ghB64(blob){ return new Promise(function(res, rej){ var fr = new FileReader(); fr.onload = function(){ res(String(fr.result).split(",")[1] || ""); }; fr.onerror = rej; fr.readAsDataURL(blob); }); }
+function ghPublish(files){
+  var br = ghCfg().branch, base, tree0, existing = {}, entries = [];
+  return ghApi("/git/ref/heads/" + br).then(function(r){ base = r.object.sha; return ghApi("/git/commits/" + base); })
+    .then(function(c){ tree0 = c.tree.sha; return ghApi("/git/trees/" + tree0 + "?recursive=1"); })
+    .then(function(t){
+      (t.tree || []).forEach(function(x){ existing[x.path] = 1; });
+      return Object.keys(files).reduce(function(p, n){ return p.then(function(){
+        var v = files[n];
+        if (v === null) { if (existing[n]) entries.push({path: n, mode: "100644", type: "blob", sha: null}); return; }
+        var pr = typeof v === "string" ? Promise.resolve({content: v, encoding: "utf-8"}) : ghB64(v).then(function(b){ return {content: b, encoding: "base64"}; });
+        return pr.then(function(b){ return ghApi("/git/blobs", {method: "POST", body: b}); }).then(function(bl){ entries.push({path: n, mode: "100644", type: "blob", sha: bl.sha}); });
+      }); }, Promise.resolve());
+    })
+    .then(function(){ return ghApi("/git/trees", {method: "POST", body: {base_tree: tree0, tree: entries}}); })
+    .then(function(t){ return ghApi("/git/commits", {method: "POST", body: {message: "Update portfolio", tree: t.sha, parents: [base]}}); })
+    .then(function(c){ return ghApi("/git/refs/heads/" + br, {method: "PATCH", body: {sha: c.sha}}).catch(function(e){ if (e.status === 422 || e.status === 409) e.code = "gh_conflict"; throw e; }); })
+    .catch(function(e){ if (!e.code && (e.status === 401 || e.status === 403 || e.status === 404)) e.code = "gh_auth"; throw e; });
+}
+function ghAsk(){
+  return new Promise(function(res){
+    var box = document.createElement("div"); box.className = "cmp"; box.setAttribute("role", "dialog"); box.setAttribute("aria-modal", "true");
+    box.innerHTML = '<div class="cmp-in"><b>دخول المالك</b><p class="hint">الصق مفتاح GitHub (Fine-grained token) الذي له صلاحية Contents: Read and write على مستودع الموقع فقط. يُحفظ في هذا المتصفح فقط، ولا يدخل الموقع ولا المستودع.</p>' +
+      '<input class="ed-in" id="ghTok" type="password" dir="ltr" autocomplete="off" placeholder="github_pat_…"><div class="row-ed"><button class="mini" id="ghOk">دخول</button><button class="mini ghost" id="ghNo">إلغاء</button></div></div>';
+    document.body.appendChild(box);
+    var inp = box.querySelector("#ghTok"); inp.focus();
+    function done(v){ box.remove(); res(v); }
+    box.querySelector("#ghOk").onclick = function(){ done(inp.value.trim()); };
+    box.querySelector("#ghNo").onclick = function(){ done(""); };
+    inp.onkeydown = function(e){ if (e.key === "Enter") done(inp.value.trim()); };
+  });
+}
+function ghInit(){
+  if (location.hash === "#logout") { try { localStorage.removeItem(GHT); } catch (e) {} ghMem = ""; history.replaceState(null, "", location.pathname + location.search); toast("تم تسجيل الخروج من المحرر"); return; }
+  if (!/^#edit/.test(location.hash) || !ghCfg().repo) return;
+  var have = ghTok() ? Promise.resolve() : ghAsk().then(function(t){
+    if (!t) throw {cancel: true};
+    ghMem = t; try { localStorage.setItem(GHT, t); } catch (e) {}
+  });
+  have.then(function(){ return ghApi(""); })
+    .then(function(r){
+      if (!r.permissions || !r.permissions.push) { var e = new Error("no push"); e.status = 403; throw e; }
+      return ghApi("/contents/index.html?ref=" + encodeURIComponent(ghCfg().branch), {raw: true});
+    })
+    .then(function(txt){
+      var mm = /<script type="application\/json" id="pf-data">([\s\S]*?)<\/script>/.exec(txt || "");
+      if (mm) { try { var L = merge(D, JSON.parse(mm[1])); if (JSON.stringify(L) !== JSON.stringify(S)) { S = L; ORIGINAL = JSON.stringify(S); hLast = ORIGINAL; applyTheme(); toast("تم تحميل آخر نسخة محفوظة من المستودع"); } } catch (e) {} }
+      artifactNs = {publish: ghPublish}; canEdit = true;
+      var now = JSON.stringify(S);
+      idbGet("undo").then(function(u){ if (u && u.s && Date.now() - (u.at || 0) < 7 * 864e5) { undoAvail = true; render(); } });
+      return draftGet().then(function(d){
+        if (d && d.s && d.s !== now) pending = d;
+        else { try { var st = sessionStorage.getItem("pf-pending"); if (st && st !== now) pending = {s: st, blobs: {}}; } catch (e) {} }
+        render();
+        toast("تم الدخول. اضغط «تعديل الصفحة»");
+      });
+    })
+    .catch(function(e){
+      if (e && e.cancel) return;
+      if (e && (e.status === 401 || e.status === 403 || e.status === 404)) { try { localStorage.removeItem(GHT); } catch (e2) {} ghMem = ""; toast("تعذر الدخول: المفتاح غير صالح أو بلا صلاحية على المستودع. أعد المحاولة بمفتاح جديد."); }
+      else toast("تعذر الاتصال بـ GitHub. تأكد من الإنترنت وحاول مرة أخرى.");
+    });
+}
 (function(){
-  var c = window.claude; if (!c || !c.use) return;
+  var c = window.claude; if (!c || !c.use) { ghInit(); return; }
   Promise.all([c.use("user"), c.use("artifact")]).then(function(r){
     var u = r[0]; artifactNs = r[1];
     if (!u || !artifactNs) return;
